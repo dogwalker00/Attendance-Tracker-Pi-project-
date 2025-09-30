@@ -4,9 +4,10 @@ import csv
 import os
 import time
 from datetime import datetime, timedelta
+import json
 
 thingsboard_host = 'demo.thingsboard.io'
-access_token = 'Mqtv8kLjV5bbhRDUp3mv'
+access_token = 'Mqtv8kLjV5bbhRDUp3mv'  # Replace with your access token
 
 client = mqtt.Client()
 client.username_pw_set(access_token)
@@ -55,6 +56,16 @@ def save_data(data):
         for barcode, info in data.items():
             writer.writerow([info['name'], barcode] + info['week_data'])
 
+# Publish telemetry data to ThingsBoard
+def publish_telemetry(data, current_week):
+    telemetry_data = {}
+    for barcode, info in data.items():
+        telemetry_data[info['name']] = info['week_data'][current_week]  # Send attendance for the current week
+
+    payload = json.dumps(telemetry_data)
+    client.publish('v1/devices/me/telemetry', payload)
+    print("Telemetry data sent to ThingsBoard:", payload)
+
 # Main function to run the barcode scanner
 def main():
     data = load_data()
@@ -75,6 +86,7 @@ def main():
         update_week_data(scanned_data, data, current_week)
 
     save_data(data)
+    publish_telemetry(data, current_week)  # Publish telemetry data
     print(f"Week {current_week + 1} attendance tracking ended.")
 
 if __name__ == "__main__":
