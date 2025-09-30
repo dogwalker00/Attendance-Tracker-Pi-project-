@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import paho.mqtt.client as mqtt
-import csv 
+import csv
 import os
+import time
+from datetime import datetime, timedelta
 
 thingsboard_host = 'demo.thingsboard.io'
 access_token = 'Mqtv8kLjV5bbhRDUp3mv'
@@ -12,23 +14,69 @@ client.connect(thingsboard_host, 1883, 60)
 
 csv_file_path = 'scanned_data.csv'
 
-# Corrected the method name and syntax
-if not os.path.exists(csv_file_path):  # Changed 'exist' to 'exists' and replaced ';' with ':'
+# Load existing data from the CSV file
+def load_data():
+    data = {}
+    if os.path.exists(csv_file_path):
+        with open(csv_file_path, mode='r', newline='') as file:
+            reader = csv.reader(file)
+            headers = next(reader)  # Skip header row
+            for row in reader:
+                name = row[0]
+                barcode = row[1]
+                week_data = [int(value) if value else 0 for value in row[2:]]
+                data[barcode] = {'name': name, 'week_data': week_data}
+    return data
+
+# Get the next available week column
+def get_next_week(data):
+    for i in range(7):  # Weeks 1 to 7
+        if all(data[barcode]['week_data'][i] == 0 for barcode in data):
+            return i
+    return None  # All weeks are filled
+
+# Update the week data for the scanned barcode
+def update_week_data(barcode, data, current_week):
+    if barcode in data:
+        # Update week data (increment the current week)
+        if data[barcode]['week_data'][current_week] < 1:  # Increment only if it's less than 1
+            data[barcode]['week_data'][current_week] += 1
+            print(f"Updated {data[barcode]['name']} for week {current_week + 1}.")
+        else:
+            print(f"Week {current_week + 1} for {data[barcode]['name']} is already filled.")
+    else:
+        print(f"Barcode {barcode} not found in the data.")
+
+# Save updated data back to the CSV file
+def save_data(data):
     with open(csv_file_path, mode='w', newline='') as file:
         writer = csv.writer(file)
-        writer.writerow(['barcode'])  # Corrected 'writeow' to 'writerow'
+        writer.writerow(['Name', 'Barcode', 'Week 1', 'Week 2', 'Week 3', 'Week 4', 'Week 5', 'Week 6', 'Week 7'])
+        for barcode, info in data.items():
+            writer.writerow([info['name'], barcode] + info['week_data'])
 
-def send_data(barcode):
-    payload = {'barcode': barcode}
-    client.publish('v1/devices/me/telemetry', str(payload))
-    
-    # Fixed the mode and syntax
-    with open(csv_file_path, mode='a', newline='') as file:  # Added '=' in 'mode='
-        writer = csv.writer(file)
-        writer.writerow([barcode])  # Corrected 'writeow' to 'writerow'
+# Main function to run the barcode scanner
+def main():
+    data = load_data()
+    current_week = get_next_week(data)
 
-# Moved the while loop outside the function
-while True:
-    scanned_data = input("Scan a barcode: ")
-    send_data(scanned_data)
+    if current_week is None:
+        print("All weeks are filled. No more attendance can be recorded.")
+        return
+
+    print(f"Starting attendance collection for Week {current_week + 1}.")
+    start_time = datetime.now()
+    end_time = start_time + timedelta(hours=1)
+
+    while datetime.now() < end_time:
+        scanned_data = input("Scan a barcode (or type 'exit' to finish early): ")
+        if scanned_data.lower() == 'exit':
+            break
+        update_week_data(scanned_data, data, current_week)
+
+    save_data(data)
+    print(f"Week {current_week + 1} attendance tracking ended.")
+
+if __name__ == "__main__":
+    main()
 
