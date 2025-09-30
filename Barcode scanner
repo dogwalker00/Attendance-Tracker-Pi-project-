@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+import paho.mqtt.client as mqtt
+import csv 
+import os
+
+thingsboard_host='demo.thingsboard.io'
+access_token='Mqtv8kLjV5bbhRDUp3mv'
+
+client = mqtt.Client()
+client.username_pw_set(access_token)
+client.connect(thingsboard_host, 1883, 60)
+
+csv_file_path='scanned_data.csv'
+
+if not os.path.exist(csv_file_path);
+    with open(csv_file_path, mode='w', newline = '') as file:
+        writer = csv.writer(file)
+        writer.writeow(['barcode'])
+
+def send_data(barcode):
+    payload = {'barcode':barcode}
+    client.publish('v1/devices/me/telemetry',
+    str(payload))
+    
+    with open(csv_file_path, mode'a', newline='') as file
+      writer = csv.writer(file)
+      writer.writeow([barcode]) 
+      
+    while True:
+        scanned_data = input("Scan a barcode:")
+        send_data(scanned_data)
+        
