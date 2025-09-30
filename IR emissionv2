@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+import time
+import json
+import RPi.GPIO as GPIO
+import paho.mqtt.client as mqtt
+
+IR_PIN = 18            # BCM pin driving transistor base
+BURST_SECONDS = 0.1    # LED on time per burst
+
+IOT_HOST = "demo.thingsboard.io"
+IOT_PORT = 1883
+USERNAME = "IQ14K1BowcIJZzUk2Rpm"
+TOPIC = "v1/devices/me/telemetry"
+
+client = mqtt.Client()
+client.username_pw_set(USERNAME)
+client.connect(IOT_HOST, IOT_PORT)
+client.loop_start()
+
+count = 0
+data = {}
+
+def setup():
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
+    GPIO.setup(IR_PIN, GPIO.OUT, initial=GPIO.LOW)
+
+def burst():
+    GPIO.output(IR_PIN, GPIO.HIGH)   # LED on (steady)
+    time.sleep(BURST_SECONDS)
+    GPIO.output(IR_PIN, GPIO.LOW)    # LED off
+
+def publish_count():
+    global count, data
+    count += 1
+    data["IR-count"] = count
+    client.publish(TOPIC, json.dumps(data), qos=0)
+    print("Sent burst. count =", count)
+
+def loop():
+    try:
+        while True:
+            burst()
+            publish_count()
+            time.sleep(5)   # wait between bursts
+    except KeyboardInterrupt:
+        pass
+
+def destroy():
+    client.loop_stop()
+    client.disconnect()
+    GPIO.cleanup()
+
+if __name__ == "__main__":
+    setup()
+    try:
+        loop()
+    finally:
+        destroy()
+

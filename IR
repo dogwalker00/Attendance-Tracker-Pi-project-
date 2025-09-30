@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+import RPi.GPIO as GPIO
+import paho.mqtt.client as mqtt
+import json
+import time
+
+IrPin  = 11
+count = 0
+
+iot_hub = "demo.thingsboard.io"
+port = 1883
+username = "lF9CvrEyq16qcCzkVlSN"
+password = ""
+topic="v1/devices/me/telemtry"
+
+client=mqtt.Client()
+client.username_pw_set(username,password)
+client.connect(iot_hub,port)
+client.loop_start()
+
+data={}
+#data=dict()
+def setup():
+	GPIO.setmode(GPIO.BOARD)       # Numbers GPIOs by physical location
+	GPIO.setup(IrPin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+def cnt(ev=None):
+	global count
+	count += 1
+	print ('Received infrared. cnt = ', count)
+    data["IR count"]= count
+    data_out=json.dumps(data)
+    client.publish(topic,data_out,0)
+
+def loop():
+	GPIO.add_event_detect(IrPin, GPIO.FALLING, callback=cnt) # wait for falling
+	while True:
+		pass   # Don't do anything
+            time.sleep(1)
+def destroy():
+	GPIO.cleanup()                     # Release resource
+
+if __name__ == '__main__':     # Program start from here
+	setup()
+	try:
+		loop()
+	except KeyboardInterrupt:  # When 'Ctrl+C' is pressed, the child program destroy() will be  executed.
+		destroy()

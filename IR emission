@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+import time
+import json
+import RPi.GPIO as GPIO
+import paho.mqtt.client as mqtt
+
+IR_PIN = 18            # BCM 18 (hardware PWM)
+BURST_SECONDS = 0.1    # how long each burst lasts
+CARRIER_FREQ = 38000   # 38 kHz carrier
+DUTY = 50.0
+
+IOT_HOST = "demo.thingsboard.io"
+IOT_PORT = 1883
+USERNAME = "IQ14K1BowcIJZzUk2Rpm"
+TOPIC = "v1/devices/me/telemetry"
+
+client = mqtt.Client()
+client.username_pw_set(USERNAME)
+client.connect(IOT_HOST, IOT_PORT)
+client.loop_start()
+
+count = 0
+data = {}
+
+def setup():
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
+    GPIO.setup(IR_PIN, GPIO.OUT)
+    global pwm
+    pwm = GPIO.PWM(IR_PIN, CARRIER_FREQ)
+    pwm.start(0)   # keep carrier off until burst
+
+def burst():
+    pwm.ChangeDutyCycle(DUTY)   # turn carrier on
+    time.sleep(BURST_SECONDS)
+    pwm.ChangeDutyCycle(0)      # turn carrier off
+
+def publish_count():
+    global count, data
+    count += 1
+    data["IR-count"] = count
+    client.publish(TOPIC, json.dumps(data), qos=0)
+    print("Sent burst. count =", count)
+
+def loop():
+    # example: send a burst every 5 seconds; change as needed
+    try:
+        while True:
+            burst()
+            publish_count()
+            time.sleep(5)
+
+def destroy():
+    pwm.stop()
+    client.loop_stop()
+    client.disconnect()
+    GPIO.cleanup()
+
+if __name__ == "__main__":
+    setup()
+    try:
+        loop()
+    finally:
+        destroy()
+

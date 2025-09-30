@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+import time
+import json
+import RPi.GPIO as GPIO
+import paho.mqtt.client as mqtt
+
+LED_PIN = 13    # BOARD pin numbers (change if you use BCM)
+PIR_PIN = 11
+
+IOT_HOST = "demo.thingsboard.io"
+IOT_PORT = 1883
+USERNAME = "LCQ73eeYsfqZx3ypAb5r"
+TOPIC = "v1/devices/me/telemetry"
+
+client = mqtt.Client()
+client.username_pw_set(USERNAME)
+client.connect(IOT_HOST, IOT_PORT)
+client.loop_start()
+
+GPIO.setmode(GPIO.BOARD)
+GPIO.setwarnings(False)
+GPIO.setup(PIR_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)  # or PUD_OFF depending on module
+GPIO.setup(LED_PIN, GPIO.OUT, initial=GPIO.LOW)
+
+data = {}
+old_value = GPIO.input(PIR_PIN)
+
+#delete try and finally off if doesnt work
+try:
+    while True:
+        pir_value = GPIO.input(PIR_PIN)
+        if pir_value and not old_value:
+            # motion started
+            GPIO.output(LED_PIN, GPIO.HIGH)
+            print("Motion detected!")
+            data["Motion-Status"] = True
+            client.publish(TOPIC, json.dumps(data), qos=0)
+        elif not pir_value and old_value:
+            # motion ended
+            GPIO.output(LED_PIN, GPIO.LOW)
+            print("Motion ended!")
+            data["Motion-Status"] = False
+            client.publish(TOPIC, json.dumps(data), qos=0)
+        old_value = pir_value
+        time.sleep(0.05)   # small pause to reduce CPU and debounce
+finally:
+    client.loop_stop()
+    client.disconnect()
+    GPIO.cleanup()
+
