@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+import RPi.GPIO as GPIO
+import time
+
+IR_PIN = 5  # BCM pin connected to transistor driving IR LED
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(IR_PIN, GPIO.OUT)
+
+try:
+    GPIO.output(IR_PIN, GPIO.HIGH)  # turn IR emitter ON and keep it on
+    while True:
+        time.sleep(1)  # idle loop, keeps script running
+except KeyboardInterrupt:
+    pass
+finally:
+    GPIO.output(IR_PIN, GPIO.LOW)
+    GPIO.cleanup()
+
