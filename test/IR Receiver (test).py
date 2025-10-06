@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 import RPi.GPIO as GPIO
 
-IrPin  = 11
+IrPin  = 18
 count = 0
 
 def setup():
-	GPIO.setmode(GPIO.BOARD)       # Numbers GPIOs by physical location
+	GPIO.setmode(GPIO.BCM)       # Numbers GPIOs by physical location
 	GPIO.setup(IrPin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
 def cnt(ev=None):
