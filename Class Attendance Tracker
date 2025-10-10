@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+# Combined barcode attendance + IR disruption logger
+import csv
+import json
+import os
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+
+import RPi.GPIO as GPIO
+import paho.mqtt.client as mqtt
+
+# --- Configuration ---
+# CSV
+CSV_PATH = 'Barcode.csv'
+
+# ThingsBoard
+TB_HOST = 'demo.thingsboard.io'
+ACCESS_TOKEN_MAIN = 'Mqtv8kLjV5bbhRDUp3mv'   # per-person telemetry
+ACCESS_TOKEN_TOTAL_ATTENDANCE = 'eGnEMagjPmj3NfILx0nF'  # total attendance device (NEW)
+ACCESS_TOKEN_DISRUPTION = 'zQ87wVhhSkHoQ2BiI6wM'       # disruption device (existing)
+
+# Barcode attendance window
+ATTENDANCE_DURATION_SECONDS = 60 * 60  # 1 hour
+
+# IR hardware (RPi)
+IR_PIN = 18
+EMITTER_PIN = 5
+LED_PIN = 12
+DEBOUNCE_MS = 200
+COMMON_ANODE = False
+
+# IR publish interval
+IR_PUBLISH_INTERVAL = 2 * 60 * 60  # 2 hours
+
+# --- Globals ---
+data_lock = threading.Lock()
+data = {}
+
+ir_count = 0
+ir_last_event_ms = 0.0
+ir_stop_event = threading.Event()
+daily_aggregates = {}  # { 'YYYY-MM-DD': int } plus '__signal_row_existing': [vals...]
+
+# MQTT clients
+client_main = mqtt.Client()
+client_total_att = mqtt.Client()
+client_disrupt = mqtt.Client()
+
+# --- MQTT setup ---
+def mqtt_connect():
+    client_main.username_pw_set(ACCESS_TOKEN_MAIN)
+    client_main.connect(TB_HOST, 1883, 60)
+    client_main.loop_start()
+
+    client_total_att.username_pw_set(ACCESS_TOKEN_TOTAL_ATTENDANCE)
+    client_total_att.connect(TB_HOST, 1883, 60)
+    client_total_att.loop_start()
+
+    client_disrupt.username_pw_set(ACCESS_TOKEN_DISRUPTION)
+    client_disrupt.connect(TB_HOST, 1883, 60)
+    client_disrupt.loop_start()
+
+def mqtt_publish_main(payload_dict):
+    try:
+        client_main.publish('v1/devices/me/telemetry', json.dumps(payload_dict))
+    except Exception:
+        pass
+
+def mqtt_publish_total_att(payload_dict):
+    try:
+        client_total_att.publish('v1/devices/me/telemetry', json.dumps(payload_dict))
+    except Exception:
+        pass
+
+def mqtt_publish_disrupt(payload_dict):
+    try:
+        client_disrupt.publish('v1/devices/me/telemetry', json.dumps(payload_dict))
+    except Exception:
+        pass
+
+# --- CSV load/save functions (barcode format) ---
+def load_data_from_csv():
+    global data
+    if not os.path.exists(CSV_PATH):
+        raise FileNotFoundError(f"{CSV_PATH} not found")
+    with open(CSV_PATH, mode='r', newline='') as f:
+        reader = csv.reader(f)
+        rows = list(reader)
+    if not rows:
+        raise ValueError("CSV empty or malformed")
+    for row in rows[1:]:
+        if not row or len(row) < 2:
+            continue
+        name = row[0].strip()
+        barcode = row[1].strip()
+        if barcode == '':
+            continue
+        day_values = row[2:2+7]
+        day_data = []
+        for v in day_values:
+            try:
+                day_data.append(int(v))
+            except Exception:
+                day_data.append(0)
+        while len(day_data) < 7:
+            day_data.append(0)
+        data[barcode] = {'name': name, 'day_data': day_data}
+
+def save_data_to_csv():
+    existing_rows = []
+    if os.path.exists(CSV_PATH):
+        with open(CSV_PATH, mode='r', newline='') as f:
+            existing_rows = list(csv.reader(f))
+    person_barcodes_order = []
+    if existing_rows:
+        for row in existing_rows[1:]:
+            if len(row) >= 2 and row[1].strip() != '':
+                person_barcodes_order.append(row[1].strip())
+    ordered_persons = []
+    seen = set()
+    for b in person_barcodes_order:
+        if b in data:
+            ordered_persons.append((b, data[b]))
+            seen.add(b)
+    for b, info in data.items():
+        if b not in seen:
+            ordered_persons.append((b, info))
+    footer_rows = []
+    if existing_rows:
+        last_person_idx = 0
+        for idx, row in enumerate(existing_rows[1:], start=1):
+            if len(row) >= 2 and row[1].strip() != '':
+                last_person_idx = idx
+        footer_rows = existing_rows[last_person_idx+1:] if len(existing_rows) > last_person_idx+1 else []
+    out_rows = []
+    header = ['Name', 'Barcode', 'Day 1', 'Day 2', 'Day 3', 'Day 4', 'Day 5', 'Day 6', 'Day 7']
+    out_rows.append(header)
+    for barcode, info in ordered_persons:
+        day_data = info['day_data'][:7] + [0] * max(0, 7 - len(info['day_data']))
+        out_rows.append([info['name'], barcode] + day_data)
+    # handle footer: preserve non-person rows, replace or insert Total Count row using computed total
+    current_day = get_current_day_index()
+    total_count = compute_total_count(get_data_copy(), current_day)
+    total_row = ['Total Count', str(total_count)] + ['0']*7
+    found_total = False
+    new_footer = []
+    for row in footer_rows:
+        name = row[0].strip().lower() if len(row) > 0 else ''
+        if name == 'total count':
+            found_total = True
+            r = ['Total Count', str(total_count)] + ['0']*7
+            new_footer.append(r)
+        elif name == 'signal disruptions':
+            # preserve; signal disruptions will be updated on exit
+            r = row[:2] + row[2:2+7] + ['0']*(7 - max(0, len(row)-2))
+            new_footer.append(r)
+        else:
+            new_footer.append(row)
+    if not found_total:
+        new_footer.insert(0, total_row)
+    with open(CSV_PATH, mode='w', newline='') as f:
+        writer = csv.writer(f)
+        for r in out_rows:
+            writer.writerow(r)
+        for r in new_footer:
+            writer.writerow(r)
+
+# --- Helpers ---
+def get_data_copy():
+    with data_lock:
+        return {k: {'name': v['name'], 'day_data': v['day_data'][:]} for k, v in data.items()}
+
+def get_current_day_index(dcopy=None):
+    if dcopy is None:
+        dcopy = get_data_copy()
+    for i in range(7):
+        all_zero = True
+        for barcode in dcopy:
+            vals = dcopy[barcode]['day_data']
+            val = vals[i] if i < len(vals) else 0
+            if val != 0:
+                all_zero = False
+                break
+        if all_zero:
+            return i
+    return None
+
+def compute_total_count(dcopy=None, current_day=None):
+    if dcopy is None:
+        dcopy = get_data_copy()
+    if current_day is None:
+        current_day = get_current_day_index(dcopy)
+        if current_day is None:
+            return 0
+    return sum(1 for v in dcopy.values() if (v['day_data'][current_day] if current_day < len(v['day_data']) else 0) >= 1)
+
+# --- Barcode attendance ---
+def update_day_data(barcode, current_day):
+    with data_lock:
+        if barcode in data:
+            while len(data[barcode]['day_data']) <= current_day:
+                data[barcode]['day_data'].append(0)
+            if data[barcode]['day_data'][current_day] < 1:
+                data[barcode]['day_data'][current_day] += 1
+                print(f"Updated {data[barcode]['name']} for Day {current_day + 1}.")
+            else:
+                print(f"Day {current_day + 1} for {data[barcode]['name']} is already filled.")
+        else:
+            print(f"Barcode {barcode} not found in the data.")
+
+# --- IR disruption handling (RPi only) ---
+def now_ms():
+    return time.time() * 1000.0
+
+def utc_today_str():
+    return datetime.now(timezone.utc).date().isoformat()
+
+def ensure_daily_aggregates_loaded():
+    if not os.path.exists(CSV_PATH):
+        return
+    with open(CSV_PATH, mode='r', newline='') as f:
+        reader = list(csv.reader(f))
+    if not reader:
+        return
+    for row in reader[1:]:
+        if not row:
+            continue
+        name = row[0].strip().lower()
+        if name == 'signal disruptions':
+            vals = []
+            for i in range(2, 9):
+                try:
+                    v = int(row[i]) if i < len(row) and row[i] != '' else 0
+                except Exception:
+                    v = 0
+                vals.append(v)
+            daily_aggregates['__signal_row_existing'] = vals
+            return
+
+def increment_ir_count():
+    global ir_count
+    ir_count += 1
+    d = utc_today_str()
+    daily_aggregates[d] = daily_aggregates.get(d, 0) + 1
+
+def write_signal_disruption_to_csv_for_day(day_index):
+    if not os.path.exists(CSV_PATH):
+        return
+    with open(CSV_PATH, mode='r', newline='') as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        return
+    sd_idx = None
+    total_idx = None
+    for idx, row in enumerate(rows[1:], start=1):
+        if not row:
+            continue
+        name = row[0].strip().lower()
+        if name == 'signal disruptions':
+            sd_idx = idx
+        elif name == 'total count':
+            total_idx = idx
+    if day_index is None or day_index < 0 or day_index > 6:
+        return
+    today_key = utc_today_str()
+    todays_val = daily_aggregates.get(today_key, 0)
+    existing_vals = [0]*7
+    if sd_idx is not None:
+        row = rows[sd_idx]
+        for i in range(7):
+            col = 2 + i
+            try:
+                existing_vals[i] = int(row[col]) if col < len(row) and row[col] != '' else 0
+            except Exception:
+                existing_vals[i] = 0
+    else:
+        existing_vals = daily_aggregates.get('__signal_row_existing', [0]*7)
+    existing_vals[day_index] = existing_vals[day_index] + todays_val
+    signal_row = ['Signal disruptions', ''] + [str(v) for v in existing_vals]
+    if sd_idx is not None:
+        rows[sd_idx] = signal_row
+    else:
+        insert_at = len(rows)
+        if total_idx is not None:
+            insert_at = total_idx + 1
+        rows.insert(insert_at, signal_row)
+    with open(CSV_PATH, mode='w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerows(rows)
+
+# --- IR GPIO setup ---
+def ir_setup():
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(IR_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(EMITTER_PIN, GPIO.OUT)
+    GPIO.output(EMITTER_PIN, GPIO.HIGH)
+    GPIO.setup(LED_PIN, GPIO.OUT)
+    global ON_LEVEL, OFF_LEVEL
+    ON_LEVEL = GPIO.LOW if COMMON_ANODE else GPIO.HIGH
+    OFF_LEVEL = GPIO.HIGH if COMMON_ANODE else GPIO.LOW
+    GPIO.output(LED_PIN, OFF_LEVEL)
+
+def gpio_set_led(on):
+    GPIO.output(LED_PIN, ON_LEVEL if on else OFF_LEVEL)
+
+def ir_handle_callback(channel):
+    global ir_last_event_ms
+    now = now_ms()
+    if now - ir_last_event_ms < DEBOUNCE_MS:
+        return
+    ir_last_event_ms = now
+    state = GPIO.input(IR_PIN)
+    if state == GPIO.LOW:
+        increment_ir_count()
+        gpio_set_led(True)
+    else:
+        gpio_set_led(False)
+
+def ir_publisher_thread():
+    while not ir_stop_event.wait(IR_PUBLISH_INTERVAL):
+        try:
+            mqtt_publish_disrupt({"count": ir_count})
+        except Exception:
+            pass
+
+# --- Main flow ---
+def run_attendance_and_ir():
+    mqtt_connect()
+    load_data_from_csv()
+    ensure_daily_aggregates_loaded()
+    ir_setup()
+    GPIO.add_event_detect(IR_PIN, GPIO.BOTH, callback=ir_handle_callback, bouncetime=DEBOUNCE_MS)
+    t_ir = threading.Thread(target=ir_publisher_thread, daemon=True)
+    t_ir.start()
+    current_day = get_current_day_index()
+    if current_day is None:
+        print("All days are filled. No more attendance can be recorded.")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            # no valid day; still write nothing but stop threads/cleanup
+            ir_stop_event.set()
+            t_ir.join()
+            ir_cleanup_and_disconnect()
+            return
+    print(f"Starting attendance collection for Day {current_day + 1}.")
+    start = datetime.now()
+    end = start + timedelta(seconds=ATTENDANCE_DURATION_SECONDS)
+    try:
+        while datetime.now() < end:
+            scanned = input("Scan a barcode (or type 'exit' to finish early): ").strip()
+            if scanned.lower() == 'exit':
+                break
+            if scanned == '':
+                continue
+            update_day_data(scanned, current_day)
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
+    # after attendance window, save data and publish telemetry
+    save_data_to_csv()
+    dcopy = get_data_copy()
+    # publish per-person telemetry
+    telemetry = {}
+    for barcode, info in dcopy.items():
+        val = info['day_data'][current_day] if current_day < len(info['day_data']) else 0
+        telemetry[info['name']] = val
+    mqtt_publish_main(telemetry)
+    # publish total attendance to TOTAL_ATTENDANCE device
+    total = compute_total_count(dcopy, current_day)
+    mqtt_publish_total_att({'Total Count': total, 'day': current_day + 1})
+    print(f"Day {current_day + 1} attendance ended. Total Count: {total}")
+    # on exit, write today's disruption aggregate into Barcode.csv Signal disruptions row
+    write_signal_disruption_to_csv_for_day(current_day)
+    # publish final disruption count as well
+    mqtt_publish_disrupt({'count': ir_count, 'day': current_day + 1})
+    # stop IR thread and cleanup
+    ir_stop_event.set()
+    t_ir.join()
+    ir_cleanup_and_disconnect()
+
+def ir_cleanup_and_disconnect():
+    try:
+        gpio_set_led(False)
+    except Exception:
+        pass
+    try:
+        GPIO.output(EMITTER_PIN, GPIO.LOW)
+    except Exception:
+        pass
+    try:
+        GPIO.cleanup()
+    except Exception:
+        pass
+    try:
+        client_main.loop_stop()
+        client_main.disconnect()
+    except Exception:
+        pass
+    try:
+        client_total_att.loop_stop()
+        client_total_att.disconnect()
+    except Exception:
+        pass
+    try:
+        client_disrupt.loop_stop()
+        client_disrupt.disconnect()
+    except Exception:
+        pass
+
+if __name__ == '__main__':
+    run_attendance_and_ir()
+
