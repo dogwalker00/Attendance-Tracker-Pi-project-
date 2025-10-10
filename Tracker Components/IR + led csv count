@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+import RPi.GPIO as GPIO
+import time
+import json
+import threading
+import paho.mqtt.client as mqtt
+import csv
+import os
+from datetime import datetime, timezone
+
+# Config
+IR_PIN = 18
+EMITTER_PIN = 5
+LED_PIN = 12
+DEBOUNCE_MS = 200
+COMMON_ANODE = False
+
+THINGSBOARD_HOST = 'demo.thingsboard.io'
+ACCESS_TOKEN = 'zQ87wVhhSkHoQ2BiI6wM'
+PUBLISH_INTERVAL = 2 * 60 * 60  # 2 hours
+
+# CSV file for daily aggregated disruptions
+CSV_FILE = 'signal_disruptions_daily.csv'
+
+# Globals
+count = 0
+_last_event_time = 0.0
+_stop_event = threading.Event()
+# daily aggregate: { 'YYYY-MM-DD': int }
+daily_aggregate = {}
+
+# MQTT
+client = mqtt.Client()
+
+def tb_connect():
+    client.username_pw_set(ACCESS_TOKEN)
+    client.connect(THINGSBOARD_HOST, 1883, 60)
+    client.loop_start()
+
+def tb_send_count(n):
+    client.publish('v1/devices/me/telemetry', json.dumps({"count": n}), qos=1)
+
+def now_ms():
+    return time.time() * 1000.0
+
+def utc_today():
+    return datetime.now(timezone.utc).date().isoformat()
+
+def setup():
+    global ON_LEVEL, OFF_LEVEL
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(IR_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(EMITTER_PIN, GPIO.OUT)
+    GPIO.output(EMITTER_PIN, GPIO.HIGH)
+    GPIO.setup(LED_PIN, GPIO.OUT)
+    ON_LEVEL = GPIO.LOW if COMMON_ANODE else GPIO.HIGH
+    OFF_LEVEL = GPIO.HIGH if COMMON_ANODE else GPIO.LOW
+    GPIO.output(LED_PIN, OFF_LEVEL)
+    ensure_csv_exists()
+    load_existing_daily_aggregates()
+
+def set_led(on):
+    GPIO.output(LED_PIN, ON_LEVEL if on else OFF_LEVEL)
+
+def ensure_csv_exists():
+    if not os.path.exists(CSV_FILE):
+        with open(CSV_FILE, mode='w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['date_utc', 'disruption_count'])
+
+def load_existing_daily_aggregates():
+    # Preload any existing CSV values so we append/increment the same date if present
+    if not os.path.exists(CSV_FILE):
+        return
+    try:
+        with open(CSV_FILE, mode='r', newline='') as f:
+            reader = csv.reader(f)
+            next(reader, None)
+            for row in reader:
+                if len(row) >= 2:
+                    date = row[0]
+                    try:
+                        val = int(row[1])
+                    except Exception:
+                        val = 0
+                    daily_aggregate[date] = daily_aggregate.get(date, 0) + val
+    except Exception:
+        pass
+
+def increment_daily_aggregate():
+    d = utc_today()
+    daily_aggregate[d] = daily_aggregate.get(d, 0) + 1
+
+def handle_ir(channel):
+    global count, _last_event_time
+    now = now_ms()
+    if now - _last_event_time < DEBOUNCE_MS:
+        return
+    _last_event_time = now
+    if GPIO.input(IR_PIN) == GPIO.LOW:
+        count += 1
+        set_led(True)
+        increment_daily_aggregate()
+    else:
+        set_led(False)
+
+def publisher():
+    while not _stop_event.wait(PUBLISH_INTERVAL):
+        try:
+            tb_send_count(count)
+        except Exception:
+            pass
+
+def save_daily_aggregates():
+    # read existing CSV into dict to preserve other dates, then overwrite with merged values
+    existing = {}
+    if os.path.exists(CSV_FILE):
+        try:
+            with open(CSV_FILE, mode='r', newline='') as f:
+                reader = csv.reader(f)
+                next(reader, None)
+                for row in reader:
+                    if len(row) >= 2:
+                        date = row[0]
+                        try:
+                            val = int(row[1])
+                        except Exception:
+                            val = 0
+                        existing[date] = existing.get(date, 0) + val
+        except Exception:
+            pass
+    # merge in-memory daily_aggregate
+    for k, v in daily_aggregate.items():
+        existing[k] = existing.get(k, 0) + v
+    # write merged results back
+    try:
+        with open(CSV_FILE, mode='w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['date_utc', 'disruption_count'])
+            for date in sorted(existing.keys()):
+                writer.writerow([date, existing[date]])
+    except Exception:
+        pass
+
+def main_loop():
+    GPIO.add_event_detect(IR_PIN, GPIO.BOTH, callback=handle_ir, bouncetime=DEBOUNCE_MS)
+    t = threading.Thread(target=publisher, daemon=True)
+    t.start()
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        _stop_event.set()
+        t.join()
+
+def cleanup():
+    set_led(False)
+    GPIO.output(EMITTER_PIN, GPIO.LOW)
+    GPIO.cleanup()
+    try:
+        client.loop_stop()
+        client.disconnect()
+    except Exception:
+        pass
+    # on exit write daily aggregates to CSV
+    save_daily_aggregates()
+
+if __name__ == "__main__":
+    tb_connect()
+    setup()
+    try:
+        main_loop()
+    finally:
+        cleanup()
+
