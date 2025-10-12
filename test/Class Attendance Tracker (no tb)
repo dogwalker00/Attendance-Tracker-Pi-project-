@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+import RPi.GPIO as GPIO
+import time
+import csv
+from datetime import datetime, timedelta
+import json
+
+# Barcode attendance window
+ATTENDANCE_DURATION_SECONDS = 60 * 60  # 1 hour
+
+# --- Hardware config ---
+IR_RX_PIN = 18
+IR_TX_PIN = 5
+LED_PIN = 12
+COOLDOWN = 0.6  # seconds to ignore repeated triggers
+LED_PULSE_TIME = 0.12  # seconds LED stays on per disruption
+
+# CSV path and disruption cell location
+csv_file_path = 'Barcode.csv'
+DISRUPTION_ROW_INDEX = 22   # zero-based index for row 23
+DISRUPTION_START_COL = 2    # zero-based index for column 3 (Day1)
+NUM_DAY_COLS = 7
+
+# --- Beam state ---
+cnt = 0
+last_time = 0.0
+
+# --- CSV utilities ---
+def load_csv_rows():
+    with open(csv_file_path, mode='r', newline='') as f:
+        return list(csv.reader(f))
+
+def save_csv_rows(rows):
+    with open(csv_file_path, mode='w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerows(rows)
+
+# --- Per-person CSV handling ---
+def load_data():
+    data = {}
+    rows = load_csv_rows()
+    if not rows:
+        return data
+    headers = rows[0]
+    for row in rows[1:]:
+        if not row or len(row) < 2:
+            continue
+        name = row[0].strip()
+        barcode = row[1].strip()
+        day_values = row[2:2+NUM_DAY_COLS]
+        day_data = [int(v) if v and v.isdigit() else 0 for v in day_values]
+        while len(day_data) < NUM_DAY_COLS:
+            day_data.append(0)
+        data[barcode] = {'name': name, 'day_data': day_data}
+    return data
+
+def get_next_day(data):
+    for i in range(NUM_DAY_COLS):
+        if all((data[barcode]['day_data'][i] if i < len(data[barcode]['day_data']) else 0) == 0 for barcode in data):
+            return i
+    return None
+
+def update_day_data(barcode, data, current_day):
+    if barcode in data:
+        while len(data[barcode]['day_data']) <= current_day:
+            data[barcode]['day_data'].append(0)
+        if data[barcode]['day_data'][current_day] < 1:
+            data[barcode]['day_data'][current_day] += 1
+            print(f"Updated {data[barcode]['name']} for Day {current_day + 1}.")
+        else:
+            print(f"Day {current_day + 1} for {data[barcode]['name']} is already filled.")
+    else:
+        print(f"Barcode {barcode} not found in the data.")
+
+def build_main_table_rows(data):
+    rows = []
+    rows.append(['Name', 'Barcode'] + [f'Day {i+1}' for i in range(NUM_DAY_COLS)])
+    for barcode, info in data.items():
+        day_data = info['day_data'][:NUM_DAY_COLS] + [0]*max(0, NUM_DAY_COLS - len(info['day_data']))
+        rows.append([info['name'], barcode] + day_data)
+    return rows
+
+# --- Write disruptions into fixed row (row 23) and overwrite it ---
+def set_disruption_row(rows, disruption_count, current_day):
+    # Ensure rows list has at least DISRUPTION_ROW_INDEX+1 entries
+    while len(rows) <= DISRUPTION_ROW_INDEX:
+        rows.append([])
+    # Prepare disruption row: Name, Barcode, Day1..Day7
+    disruption_row = ['Disruptions', ''] + [''] * NUM_DAY_COLS
+    disruption_row[2 + current_day] = str(disruption_count)
+    rows[DISRUPTION_ROW_INDEX] = disruption_row
+    return rows
+
+# --- GPIO ---
+def setup_gpio():
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(IR_RX_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(IR_TX_PIN, GPIO.OUT)
+    GPIO.setup(LED_PIN, GPIO.OUT)
+    GPIO.output(IR_TX_PIN, GPIO.HIGH)
+    GPIO.output(LED_PIN, GPIO.LOW)
+
+def beam_callback(channel=None):
+    global cnt, last_time
+    now = time.time()
+    if now - last_time >= COOLDOWN:
+        cnt += 1
+        last_time = now
+        GPIO.output(LED_PIN, GPIO.HIGH)
+        time.sleep(LED_PULSE_TIME)
+        GPIO.output(LED_PIN, GPIO.LOW)
+
+def start_beam_detection():
+    GPIO.add_event_detect(IR_RX_PIN, GPIO.FALLING, callback=beam_callback)
+
+def stop_gpio():
+    try:
+        GPIO.output(IR_TX_PIN, GPIO.LOW)
+    except Exception:
+        pass
+    try:
+        GPIO.output(LED_PIN, GPIO.LOW)
+    except Exception:
+        pass
+    GPIO.cleanup()
+
+# --- Main ---
+def main():
+    data = load_data()
+    current_day = get_next_day(data)
+    if current_day is None:
+        print("All days are filled.")
+        return
+
+    setup_gpio()
+    start_beam_detection()
+
+    print(f"Starting Day {current_day + 1}. Scan barcodes for {ATTENDANCE_DURATION_SECONDS//60} minutes or type 'exit'.")
+    start_time = datetime.now()
+    end_time = start_time + timedelta(seconds=ATTENDANCE_DURATION_SECONDS)
+
+    try:
+        while datetime.now() < end_time:
+            scanned_data = input("Scan a barcode (or type 'exit' to finish early): ").strip()
+            if scanned_data.lower() == 'exit':
+                break
+            if scanned_data == '':
+                continue
+            update_day_data(scanned_data, data, current_day)
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
+    finally:
+        stop_gpio()
+        print(f"Total disruptions (cnt) = {cnt}")
+
+        # Save main table and overwrite disruption row in the same CSV
+        try:
+            main_rows = build_main_table_rows(data)
+            existing_rows = load_csv_rows()
+            # Replace the top len(main_rows) rows with main_rows
+            merged_rows = main_rows + existing_rows[len(main_rows):]
+            # Overwrite disruption row (row 23) with disruption data
+            merged_rows = set_disruption_row(merged_rows, cnt, current_day)
+            save_csv_rows(merged_rows)
+        except Exception as e:
+            print("Failed saving CSV:", e)
+
+        # Compute and display total
+        try:
+            total = sum(1 for info in data.values() if (info['day_data'][current_day] if current_day < len(info['day_data']) else 0) >= 1)
+            print(f"Day {current_day + 1} ended. Total Count: {total}")
+        except Exception:
+            pass
+
+if __name__ == "__main__":
+    main()
+
