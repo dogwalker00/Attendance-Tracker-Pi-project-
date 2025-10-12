@@ -26,8 +26,9 @@ LED_PULSE_TIME = 0.12  # seconds LED stays on per disruption
 csv_file_path = 'Barcode.csv'
 DISRUPTION_ROW_INDEX = 22   # zero-based index for row 23
 DISRUPTION_START_COL = 2    # zero-based index for column 3 (Day1)
+NUM_DAY_COLS = 7
 
-# MQTT clients (one per ThingsBoard device token)
+# MQTT clients
 client_main = mqtt.Client(); client_main.username_pw_set(ACCESS_TOKEN_MAIN); client_main.connect(Thingsboard_HOST, 1883, 60)
 client_total = mqtt.Client(); client_total.username_pw_set(ACCESS_TOKEN_TOTAL_ATTENDANCE); client_total.connect(Thingsboard_HOST, 1883, 60)
 client_disruption = mqtt.Client(); client_disruption.username_pw_set(ACCESS_TOKEN_DISRUPTION); client_disruption.connect(Thingsboard_HOST, 1883, 60)
@@ -36,7 +37,7 @@ client_disruption = mqtt.Client(); client_disruption.username_pw_set(ACCESS_TOKE
 cnt = 0
 last_time = 0.0
 
-# --- CSV utilities that preserve whole sheet ---
+# --- CSV utilities ---
 def load_csv_rows():
     with open(csv_file_path, mode='r', newline='') as f:
         return list(csv.reader(f))
@@ -46,26 +47,27 @@ def save_csv_rows(rows):
         writer = csv.writer(f)
         writer.writerows(rows)
 
-# --- Original per-person CSV handling (assumes Barcode.csv main table in top rows) ---
+# --- Per-person CSV handling ---
 def load_data():
     data = {}
-    with open(csv_file_path, mode='r', newline='') as file:
-        reader = csv.reader(file)
-        headers = next(reader)
-        for row in reader:
-            if not row:
-                continue
-            name = row[0].strip()
-            barcode = row[1].strip()
-            day_values = row[2:2+7]
-            day_data = [int(value) if value and value.isdigit() else 0 for value in day_values]
-            while len(day_data) < 7:
-                day_data.append(0)
-            data[barcode] = {'name': name, 'day_data': day_data}
+    rows = load_csv_rows()
+    if not rows:
+        return data
+    headers = rows[0]
+    for row in rows[1:]:
+        if not row or len(row) < 2:
+            continue
+        name = row[0].strip()
+        barcode = row[1].strip()
+        day_values = row[2:2+NUM_DAY_COLS]
+        day_data = [int(v) if v and v.isdigit() else 0 for v in day_values]
+        while len(day_data) < NUM_DAY_COLS:
+            day_data.append(0)
+        data[barcode] = {'name': name, 'day_data': day_data}
     return data
 
 def get_next_day(data):
-    for i in range(7):
+    for i in range(NUM_DAY_COLS):
         if all((data[barcode]['day_data'][i] if i < len(data[barcode]['day_data']) else 0) == 0 for barcode in data):
             return i
     return None
@@ -82,37 +84,24 @@ def update_day_data(barcode, data, current_day):
     else:
         print(f"Barcode {barcode} not found in the data.")
 
-def save_data_main_table(data):
-    # Overwrite the top part (main table). We'll reconstruct rows: header + per-person rows.
+def build_main_table_rows(data):
     rows = []
-    rows.append(['Name', 'Barcode', 'Day 1', 'Day 2', 'Day 3', 'Day 4', 'Day 5', 'Day 6', 'Day 7'])
+    rows.append(['Name', 'Barcode'] + [f'Day {i+1}' for i in range(NUM_DAY_COLS)])
     for barcode, info in data.items():
-        day_data = info['day_data'][:7] + [0] * max(0, 7 - len(info['day_data']))
+        day_data = info['day_data'][:NUM_DAY_COLS] + [0]*max(0, NUM_DAY_COLS - len(info['day_data']))
         rows.append([info['name'], barcode] + day_data)
-    return rows  # returned to be merged with preserved sheet
+    return rows
 
-# --- Write disruption count into row 23 col (3 + current_day) preserving the rest of sheet ---
-def write_disruption_to_csv_cell(disruption_count, current_day):
-    rows = load_csv_rows()
-    # Ensure there are at least DISRUPTION_ROW_INDEX+1 rows
+# --- Write disruptions into fixed row (row 23) and overwrite it ---
+def set_disruption_row(rows, disruption_count, current_day):
+    # Ensure rows list has at least DISRUPTION_ROW_INDEX+1 entries
     while len(rows) <= DISRUPTION_ROW_INDEX:
         rows.append([])
-    target_col = DISRUPTION_START_COL + current_day
-    # Ensure the target row has enough columns
-    while len(rows[DISRUPTION_ROW_INDEX]) <= target_col:
-        rows[DISRUPTION_ROW_INDEX].append('')
-    rows[DISRUPTION_ROW_INDEX][target_col] = str(disruption_count)
-    save_csv_rows(rows)
-
-# --- Optionally append a Disruptions summary row at the end (kept for compatibility) ---
-def append_disruption_summary_row(disruption_count, current_day):
-    # We'll load all rows, append a final row "Disruptions" with the disruption_count in the day column
-    rows = load_csv_rows()
-    # Prepare a disruptions row with at least 2 + 7 columns
-    disruption_row = ['Disruptions', ''] + ['']*7
+    # Prepare disruption row: Name, Barcode, Day1..Day7
+    disruption_row = ['Disruptions', ''] + [''] * NUM_DAY_COLS
     disruption_row[2 + current_day] = str(disruption_count)
-    rows.append(disruption_row)
-    save_csv_rows(rows)
+    rows[DISRUPTION_ROW_INDEX] = disruption_row
+    return rows
 
 # --- ThingsBoard publish functions ---
 def publish_telemetry(data, current_day):
@@ -149,7 +138,6 @@ def beam_callback(channel=None):
     if now - last_time >= COOLDOWN:
         cnt += 1
         last_time = now
-        # pulse LED briefly
         GPIO.output(LED_PIN, GPIO.HIGH)
         time.sleep(LED_PULSE_TIME)
         GPIO.output(LED_PIN, GPIO.LOW)
@@ -197,34 +185,25 @@ def main():
         stop_gpio()
         print(f"Total disruptions (cnt) = {cnt}")
 
-        # Write disruption count into fixed cell (row 23, col 3+current_day)
-        try:
-            write_disruption_to_csv_cell(cnt, current_day)
-        except Exception as e:
-            print("Failed writing disruption cell:", e)
-
-        # Also append a Disruptions summary row for compatibility
-        try:
-            append_disruption_summary_row(cnt, current_day)
-        except Exception:
-            pass
-
-        # Publish telemetry and save main table
+        # Publish disruption to ThingsBoard
         try:
             publish_disruption_count(cnt, current_day)
         except Exception:
             pass
 
+        # Save main table and overwrite disruption row in the same CSV
         try:
-            save_rows_main = save_data_main_table(data)
-            # Merge main table with existing sheet while preserving rows beyond main table:
+            main_rows = build_main_table_rows(data)
             existing_rows = load_csv_rows()
-            # Replace top len(save_rows_main) rows with save_rows_main, preserve the rest
-            merged_rows = save_rows_main + existing_rows[len(save_rows_main):]
+            # Replace the top len(main_rows) rows with main_rows
+            merged_rows = main_rows + existing_rows[len(main_rows):]
+            # Overwrite disruption row (row 23) with disruption data
+            merged_rows = set_disruption_row(merged_rows, cnt, current_day)
             save_csv_rows(merged_rows)
         except Exception as e:
-            print("Failed saving main table into CSV:", e)
+            print("Failed saving CSV:", e)
 
+        # Publish telemetry and totals
         try:
             publish_telemetry(data, current_day)
         except Exception:
